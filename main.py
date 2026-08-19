@@ -1,82 +1,103 @@
-import ctypes
+import math
 import os
 import sys
 import time
-import math
 import traceback
+import ctypes
 from pathlib import Path
 
-import pygame
+from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, QUrl
+from PyQt6.QtGui import (
+    QColor,
+    QCursor,
+    QFont,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QRegion,
+    QTransform,
+)
+from PyQt6.QtMultimedia import QSoundEffect
+from PyQt6.QtWidgets import QApplication, QFileDialog, QWidget
 
 try:
     from send2trash import send2trash
 except ImportError:
     send2trash = None
 
-try:
-    from PIL import ImageGrab
-except ImportError:
-    ImageGrab = None
 
 FPS = 60
-GROUND_MARGIN = 160
-COW_SPEED = 7
-MIN_BITE_FRAMES = 8
-MAX_BITE_FRAMES = 30
-EAT_PHASE_TARGET_FRAMES = 300
-WALK_OUT_PAUSE_FRAMES = 25
+POINT_FRAMES = 58
+TRANSFORM_FRAMES = 72
+EAT_FRAMES = 150
+PAUSE_FRAMES = 65
+FAREWELL_FRAMES = 105
+COW_SPEED_IN = 14
+COW_SPEED_OUT = 9
 
-BODY_COLOR = (232, 178, 60)
-BODY_SHADE = (196, 142, 40)
-HEAD_COLOR = (232, 178, 60)
-MUZZLE_COLOR = (150, 160, 175)
-HORN_COLOR = (90, 90, 100)
-LEG_COLOR = (150, 160, 175)
-EYE_COLOR = (40, 30, 20)
-MOUTH_COLOR = (120, 30, 30)
-TONGUE_COLOR = (210, 90, 100)
+WHITE = QColor(255, 255, 255)
+CREAM = QColor(255, 247, 220)
+INK = QColor(37, 39, 43)
+GREEN = QColor(55, 176, 78)
+DARK_GREEN = QColor(25, 105, 55)
+RED = QColor(239, 55, 43)
+GOLD = QColor(255, 205, 69)
+
+
+def resource_path(relative_path: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base / relative_path
 
 
 def log_path() -> Path:
     if getattr(sys, "frozen", False):
-        base = Path(sys.executable)
-    else:
-        base = Path(__file__)
-    return base.with_suffix(".error.log")
+        if sys.platform == "darwin":
+            directory = Path.home() / "Library" / "Logs"
+        elif sys.platform == "win32":
+            directory = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "NiuLaiCleaner"
+        else:
+            directory = Path.home() / ".local" / "state" / "NiuLaiCleaner"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / "NiuLaiCleaner.error.log"
+    return Path(__file__).with_suffix(".error.log")
 
 
 def log_error(exc: BaseException) -> None:
     try:
-        with open(log_path(), "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]\n")
-            traceback.print_exception(type(exc), exc, exc.__traceback__, file=f)
-            f.write("\n")
+        with open(log_path(), "a", encoding="utf-8") as file:
+            file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]\n")
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=file)
+            file.write("\n")
     except Exception:
         pass
 
 
-def get_target_dir() -> Path:
-    env_dir = os.environ.get("NIULAI_TARGET_DIR")
-    if env_dir:
-        return Path(env_dir)
-    return Path(os.environ["USERPROFILE"]) / "Desktop"
-
-
-SKIP_NAMES = {"desktop.ini", ".ds_store"}
-
-
-def list_target_files(target_dir: Path) -> list[Path]:
-    if not target_dir.exists():
-        return []
-    return [
-        item for item in sorted(target_dir.iterdir())
-        if item.name.lower() not in SKIP_NAMES
-    ]
-
-
-def eat_one(item: Path) -> bool:
+def register_windows_context_menu() -> None:
+    if sys.platform != "win32":
+        return
     try:
-        if send2trash is not None:
+        import winreg
+
+        if getattr(sys, "frozen", False):
+            command = f'"{sys.executable}" "%1"'
+            icon = f'"{sys.executable}",0'
+        else:
+            command = f'"{sys.executable}" "{Path(__file__).resolve()}" "%1"'
+            icon = "shell32.dll,32"
+        key_path = r"Software\Classes\*\shell\SummonCow"
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            winreg.SetValue(key, "", winreg.REG_SZ, "召唤牛来吃掉")
+            winreg.SetValueEx(key, "Icon", 0, winreg.REG_SZ, icon)
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path + r"\command") as key:
+            winreg.SetValue(key, "", winreg.REG_SZ, command)
+    except Exception as exc:
+        log_error(exc)
+
+
+def safe_delete(item: Path) -> bool:
+    try:
+        if send2trash is not None and item.exists():
             send2trash(str(item))
             return True
     except Exception as exc:
@@ -84,268 +105,648 @@ def eat_one(item: Path) -> bool:
     return False
 
 
-def force_foreground(hwnd: int) -> None:
+def requested_file() -> Path | None:
+    for argument in sys.argv[1:]:
+        if argument.startswith("-"):
+            continue
+        candidate = Path(argument).expanduser()
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def configure_macos_overlay(window: QWidget) -> None:
+    """Keep the transparent overlay on the user's currently active macOS Space."""
+    if sys.platform != "darwin":
+        return
     try:
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        HWND_TOPMOST = -1
-        SWP_NOMOVE = 0x0002
-        SWP_NOSIZE = 0x0001
-        SWP_SHOWWINDOW = 0x0040
-        SW_SHOW = 5
+        objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
 
-        fg_hwnd = user32.GetForegroundWindow()
-        fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None)
-        cur_thread = kernel32.GetCurrentThreadId()
+        def send(receiver, selector: bytes, restype=ctypes.c_void_p, argtypes=(), args=()):
+            function = objc.objc_msgSend
+            function.restype = restype
+            function.argtypes = [ctypes.c_void_p, ctypes.c_void_p, *argtypes]
+            return function(receiver, objc.sel_registerName(selector), *args)
 
-        attached = False
-        if fg_thread and fg_thread != cur_thread:
-            attached = bool(user32.AttachThreadInput(cur_thread, fg_thread, True))
+        application_class = objc.objc_getClass(b"NSApplication")
+        application = send(application_class, b"sharedApplication")
+        # Accessory apps do not pull the user away from Finder or switch Spaces.
+        send(application, b"setActivationPolicy:", None, (ctypes.c_long,), (1,))
 
-        user32.ShowWindow(hwnd, SW_SHOW)
-        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
-        user32.BringWindowToTop(hwnd)
-        user32.SetForegroundWindow(hwnd)
-
-        if attached:
-            user32.AttachThreadInput(cur_thread, fg_thread, False)
+        native_view = ctypes.c_void_p(int(window.winId()))
+        native_window = send(native_view, b"window")
+        # CanJoinAllSpaces | Stationary | FullScreenAuxiliary | IgnoresCycle
+        behavior = (1 << 0) | (1 << 4) | (1 << 8) | (1 << 6)
+        send(native_window, b"setCollectionBehavior:", None, (ctypes.c_ulong,), (behavior,))
+        send(native_window, b"setHidesOnDeactivate:", None, (ctypes.c_bool,), (False,))
+        send(native_window, b"setAcceptsMouseMovedEvents:", None, (ctypes.c_bool,), (True,))
+        send(native_window, b"orderFrontRegardless", None)
+        send(native_window, b"makeKeyWindow", None)
     except Exception as exc:
         log_error(exc)
 
 
-def capture_desktop_image(width: int, height: int):
-    """Grab the real desktop before our own window covers it."""
-    if ImageGrab is None:
-        return None
+def reveal_macos_desktop() -> list[int]:
+    """Temporarily hide regular app windows while leaving Finder's Desktop visible."""
+    if sys.platform != "darwin":
+        return []
+    hidden_pids: list[int] = []
     try:
-        img = ImageGrab.grab()
-        return img.resize((width, height))
+        objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+
+        def send(receiver, selector: bytes, restype=ctypes.c_void_p, argtypes=(), args=()):
+            function = objc.objc_msgSend
+            function.restype = restype
+            function.argtypes = [ctypes.c_void_p, ctypes.c_void_p, *argtypes]
+            return function(receiver, objc.sel_registerName(selector), *args)
+
+        workspace_class = objc.objc_getClass(b"NSWorkspace")
+        workspace = send(workspace_class, b"sharedWorkspace")
+        applications = send(workspace, b"runningApplications")
+        count = send(applications, b"count", ctypes.c_ulong)
+        current_pid = os.getpid()
+
+        for index in range(count):
+            running_app = send(
+                applications,
+                b"objectAtIndex:",
+                ctypes.c_void_p,
+                (ctypes.c_ulong,),
+                (index,),
+            )
+            pid = send(running_app, b"processIdentifier", ctypes.c_int)
+            if pid == current_pid:
+                continue
+            activation_policy = send(running_app, b"activationPolicy", ctypes.c_long)
+            is_hidden = send(running_app, b"isHidden", ctypes.c_bool)
+            if activation_policy != 0 or is_hidden:
+                continue
+            bundle_object = send(running_app, b"bundleIdentifier")
+            bundle_bytes = send(bundle_object, b"UTF8String", ctypes.c_char_p) if bundle_object else None
+            bundle_identifier = bundle_bytes.decode("utf-8") if bundle_bytes else ""
+            if bundle_identifier == "com.apple.finder":
+                continue
+            # AppKit applies hide/unhide asynchronously; remember the target even
+            # when the immediate BOOL result has not caught up with the request.
+            send(running_app, b"hide", ctypes.c_bool)
+            hidden_pids.append(pid)
     except Exception as exc:
         log_error(exc)
-        return None
+    return hidden_pids
 
 
-def image_to_surface(img):
-    if img is None:
-        return None
+def restore_macos_applications(pids: list[int]) -> None:
+    """Restore only the applications hidden by reveal_macos_desktop()."""
+    if sys.platform != "darwin" or not pids:
+        return
     try:
-        raw = img.tobytes()
-        surf = pygame.image.fromstring(raw, img.size, img.mode)
-        return surf.convert()
+        objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+
+        def send(receiver, selector: bytes, restype=ctypes.c_void_p, argtypes=(), args=()):
+            function = objc.objc_msgSend
+            function.restype = restype
+            function.argtypes = [ctypes.c_void_p, ctypes.c_void_p, *argtypes]
+            return function(receiver, objc.sel_registerName(selector), *args)
+
+        running_application_class = objc.objc_getClass(b"NSRunningApplication")
+        for pid in pids:
+            running_app = send(
+                running_application_class,
+                b"runningApplicationWithProcessIdentifier:",
+                ctypes.c_void_p,
+                (ctypes.c_int,),
+                (pid,),
+            )
+            if running_app:
+                send(running_app, b"unhide", ctypes.c_bool)
     except Exception as exc:
         log_error(exc)
-        return None
 
 
-def draw_cow(surface: pygame.Surface, cx: int, ground_y: int, mouth_open: bool, tick: int):
-    walk = tick * 0.22
-    bob = abs(math.sin(walk)) * 10
-    hip_y = ground_y - bob
-    body_cy = hip_y - 110
-    head_cy = hip_y - 235
+class CowOverlay(QWidget):
+    def __init__(self, target_file: Path):
+        super().__init__()
+        self.target_file = target_file
+        self.state = "aim"
+        self.state_timer = 0
+        self.tick = 0
+        self.target_pos: QPointF | None = None
+        self.ground_y = 0.0
+        self.cow_x = -400.0
+        self.direction = 1
+        self.stop_x = 0.0
+        self.deleted = False
+        self.deletion_attempted = False
+        self.miss_flash = 0
+        self.auto_demo = os.environ.get("NIULAI_AUTODEMO") == "1"
+        self.hidden_application_pids: list[int] = []
+        self.yes_rect = QRect()
+        self.no_rect = QRect()
 
-    # legs (thigh + shin + foot), alternating stride, drawn behind the torso
-    for side, phase in ((-1, 0.0), (1, math.pi)):
-        swing = math.sin(walk + phase) * 26
-        lift = max(0.0, math.sin(walk + phase)) * 14
-        hip_x = cx + side * 32
-        knee = (hip_x + swing * 0.4, hip_y + 60 - lift * 0.5)
-        foot = (hip_x + swing, ground_y - lift)
-        pygame.draw.line(surface, BODY_SHADE, (hip_x, hip_y), knee, 34)
-        pygame.draw.line(surface, BODY_SHADE, knee, foot, 34)
-        foot_rect = pygame.Rect(0, 0, 52, 26)
-        foot_rect.center = (foot[0], foot[1] + 6)
-        pygame.draw.ellipse(surface, LEG_COLOR, foot_rect)
+        self.setWindowTitle("牛来清理文件")
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setMouseTracking(True)
+        self.setCursor(QCursor(Qt.CursorShape.BlankCursor))
 
-    # torso (big round belly)
-    body_rect = pygame.Rect(0, 0, 170, 190)
-    body_rect.center = (cx, body_cy)
-    pygame.draw.ellipse(surface, BODY_SHADE, body_rect.inflate(6, 6))
-    pygame.draw.ellipse(surface, BODY_COLOR, body_rect)
+        screen = QApplication.primaryScreen()
+        self.setGeometry(screen.geometry())
 
-    # arms swinging opposite to legs, drawn over the torso edges
-    for side, phase in ((-1, math.pi), (1, 0.0)):
-        swing = math.sin(walk + phase) * 22
-        shoulder = (cx + side * 92, body_cy - 55)
-        elbow = (shoulder[0] + side * 6, shoulder[1] + 55 + swing * 0.2)
-        hand = (elbow[0] + swing * 0.5, elbow[1] + 55)
-        pygame.draw.line(surface, BODY_COLOR, shoulder, elbow, 30)
-        pygame.draw.line(surface, BODY_COLOR, elbow, hand, 30)
-        pygame.draw.circle(surface, LEG_COLOR, (int(hand[0]), int(hand[1])), 18)
+        target_height = min(330, max(250, self.height() // 3))
+        self.poses = {}
+        for name in ("walk", "point", "graze", "run"):
+            pixmap = QPixmap(str(resource_path(f"assets/cow-{name}.png")))
+            height = target_height - 22 if name == "graze" else target_height
+            self.poses[name] = pixmap.scaledToHeight(
+                height,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        self.aim_background = QPixmap(str(resource_path("assets/cow-aim-background-v1.png")))
 
-    # head
-    head_r = 74
-    pygame.draw.circle(surface, HEAD_COLOR, (cx, head_cy), head_r)
+        self.mama_sound = self.make_sound("mama.wav")
+        self.shoot_sound = self.make_sound("shoot.wav")
+        self.hoof_sound = self.make_sound("hoof.wav", loop=True)
 
-    for hx in (-34, 34):
-        horn_pts = [
-            (cx + hx, head_cy - 58),
-            (cx + hx * 1.6, head_cy - 100),
-            (cx + hx * 0.9, head_cy - 62),
-        ]
-        pygame.draw.polygon(surface, HORN_COLOR, horn_pts)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.advance)
+        self.timer.start(round(1000 / FPS))
 
-    for ex in (-66, 66):
-        ear_rect = pygame.Rect(0, 0, 32, 26)
-        ear_rect.center = (cx + ex, head_cy - 6)
-        pygame.draw.ellipse(surface, BODY_SHADE, ear_rect)
+    def make_sound(self, filename: str, loop: bool = False) -> QSoundEffect:
+        effect = QSoundEffect(self)
+        effect.setSource(QUrl.fromLocalFile(str(resource_path(f"assets/{filename}"))))
+        effect.setVolume(0.78)
+        if loop:
+            effect.setLoopCount(-2)
+        return effect
 
-    brow_y = head_cy - 24
-    for ex in (-26, 26):
-        pygame.draw.line(surface, (90, 65, 30), (cx + ex - 16, brow_y + 6), (cx + ex + 16, brow_y - 6), 6)
-        pygame.draw.circle(surface, (255, 255, 255), (cx + ex, brow_y + 20), 11)
-        pygame.draw.circle(surface, EYE_COLOR, (cx + ex, brow_y + 20), 5)
+    def start_hoofbeats(self) -> None:
+        self.hoof_sound.stop()
+        self.hoof_sound.play()
 
-    muzzle_rect = pygame.Rect(0, 0, 92, 66)
-    muzzle_rect.center = (cx, head_cy + 40)
-    pygame.draw.ellipse(surface, MUZZLE_COLOR, muzzle_rect)
+    def stop_hoofbeats(self) -> None:
+        self.hoof_sound.stop()
 
-    if mouth_open:
-        mouth_rect = pygame.Rect(0, 0, 62, 50)
-        mouth_rect.center = (muzzle_rect.centerx, muzzle_rect.centery + 8)
-        pygame.draw.ellipse(surface, MOUTH_COLOR, mouth_rect)
-        tongue_rect = pygame.Rect(0, 0, 34, 18)
-        tongue_rect.center = (muzzle_rect.centerx, muzzle_rect.centery + 22)
-        pygame.draw.ellipse(surface, TONGUE_COLOR, tongue_rect)
-    else:
-        pygame.draw.arc(
-            surface, (60, 40, 30),
-            pygame.Rect(muzzle_rect.centerx - 26, muzzle_rect.centery - 6, 52, 22),
-            math.pi * 1.05, math.pi * 1.95, 3,
+    def choose_target_position(self, position: QPointF) -> None:
+        self.target_pos = position
+        self.ground_y = max(330.0, min(self.height() - 28.0, position.y() + 112.0))
+        point_width = self.poses["point"].width()
+        if position.x() >= self.width() / 2:
+            self.direction = 1
+            self.cow_x = -self.poses["walk"].width() - 80.0
+            self.stop_x = position.x() - 74.0 - point_width / 2
+        else:
+            self.direction = -1
+            self.cow_x = self.width() + self.poses["walk"].width() + 80.0
+            self.stop_x = position.x() + 74.0 + point_width / 2
+        self.state = "cow_in"
+        self.state_timer = 0
+        self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+        self.start_hoofbeats()
+        self.update_interaction_mask()
+
+    def reset_aim(self) -> None:
+        self.stop_hoofbeats()
+        self.target_pos = None
+        self.state = "aim"
+        self.state_timer = 0
+        self.setCursor(QCursor(Qt.CursorShape.BlankCursor))
+        self.clearMask()
+
+    def advance(self) -> None:
+        self.tick += 1
+        self.state_timer += 1
+        self.miss_flash = max(0, self.miss_flash - 1)
+
+        if self.auto_demo:
+            if self.state == "aim" and self.state_timer == 42:
+                self.choose_target_position(QPointF(self.width() * 0.7, self.height() * 0.58))
+            elif self.state == "confirm" and self.state_timer == 45:
+                self.state = "transform"
+                self.state_timer = 0
+                self.shoot_sound.play()
+
+        if self.state == "cow_in":
+            self.cow_x += COW_SPEED_IN * self.direction
+            reached = self.cow_x >= self.stop_x if self.direction == 1 else self.cow_x <= self.stop_x
+            if reached:
+                self.cow_x = self.stop_x
+                self.stop_hoofbeats()
+                self.state = "point"
+                self.state_timer = 0
+                self.mama_sound.play()
+        elif self.state == "point" and self.state_timer >= POINT_FRAMES:
+            self.state = "confirm"
+            self.state_timer = 0
+        elif self.state == "transform" and self.state_timer >= TRANSFORM_FRAMES:
+            self.state = "eat"
+            self.state_timer = 0
+        elif self.state == "eat":
+            if self.state_timer >= 52 and not self.deletion_attempted:
+                self.deleted = safe_delete(self.target_file)
+                self.deletion_attempted = True
+            if self.state_timer >= EAT_FRAMES:
+                self.state = "pause"
+                self.state_timer = 0
+        elif self.state == "pause" and self.state_timer >= PAUSE_FRAMES:
+            self.state = "farewell"
+            self.state_timer = 0
+        elif self.state == "farewell" and self.state_timer >= FAREWELL_FRAMES:
+            self.state = "cow_out"
+            self.state_timer = 0
+            self.start_hoofbeats()
+        elif self.state == "cow_out":
+            self.cow_x += COW_SPEED_OUT * self.direction
+            gone = self.cow_x > self.width() + 420 if self.direction == 1 else self.cow_x < -420
+            if gone:
+                self.stop_hoofbeats()
+                self.state = "done"
+                self.state_timer = 0
+        elif self.state == "done" and self.state_timer >= 1:
+            self.close()
+            QApplication.quit()
+
+        self.update_interaction_mask()
+        self.update()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.state == "aim":
+            self.update()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self.state == "aim":
+            self.choose_target_position(event.position())
+        elif self.state == "confirm":
+            point = event.position().toPoint()
+            if self.yes_rect.contains(point):
+                self.state = "transform"
+                self.state_timer = 0
+                self.shoot_sound.play()
+            elif self.no_rect.contains(point):
+                self.reset_aim()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            if self.state == "confirm":
+                self.reset_aim()
+            else:
+                self.close()
+
+    def closeEvent(self, event) -> None:
+        self.stop_hoofbeats()
+        self.mama_sound.stop()
+        self.shoot_sound.stop()
+        restore_macos_applications(self.hidden_application_pids)
+        self.hidden_application_pids.clear()
+        event.accept()
+
+    def font(self, size: int, bold: bool = False) -> QFont:
+        family = "PingFang SC" if sys.platform == "darwin" else "Microsoft YaHei"
+        result = QFont(family, size)
+        result.setBold(bold)
+        return result
+
+    def draw_pill(self, painter: QPainter, text: str, subtext: str = "") -> None:
+        width = min(760, self.width() - 70)
+        height = 104 if subtext else 76
+        rect = QRectF((self.width() - width) / 2, 24, width, height)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 190, 45, 210))
+        painter.drawRoundedRect(rect.translated(7, 8), 24, 24)
+        painter.setPen(QPen(QColor(76, 48, 33), 4))
+        painter.setBrush(QColor(255, 250, 222, 248))
+        painter.drawRoundedRect(rect, 24, 24)
+
+        badge = QRectF(rect.left() + 18, rect.top() + 16, 126, 34)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(240, 87, 67))
+        painter.drawRoundedRect(badge, 15, 15)
+        painter.setPen(WHITE)
+        painter.setFont(self.font(13, True))
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, "牛来删除局")
+
+        painter.setPen(QColor(76, 48, 33))
+        painter.setFont(self.font(23, True))
+        title_rect = rect.adjusted(154, 7, -20, -34 if subtext else -7)
+        painter.drawText(title_rect, Qt.AlignmentFlag.AlignCenter, text)
+        if subtext:
+            painter.setPen(QColor(31, 128, 73))
+            painter.setFont(self.font(14, True))
+            painter.drawText(rect.adjusted(154, 58, -20, -9), Qt.AlignmentFlag.AlignCenter, subtext)
+
+    def draw_crosshair(self, painter: QPainter, center: QPointF) -> None:
+        pulse = 3 * math.sin(self.tick * 0.15)
+        radius = 30 + pulse
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(RED, 3))
+        painter.drawEllipse(center, radius, radius)
+        painter.drawEllipse(center, 5, 5)
+        gap, length = radius + 8, 24
+        painter.drawLine(QPointF(center.x() - gap - length, center.y()), QPointF(center.x() - gap, center.y()))
+        painter.drawLine(QPointF(center.x() + gap, center.y()), QPointF(center.x() + gap + length, center.y()))
+        painter.drawLine(QPointF(center.x(), center.y() - gap - length), QPointF(center.x(), center.y() - gap))
+        painter.drawLine(QPointF(center.x(), center.y() + gap), QPointF(center.x(), center.y() + gap + length))
+
+    def draw_aim_background(self, painter: QPainter) -> None:
+        if self.aim_background.isNull():
+            return
+        scaled = self.aim_background.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = (self.width() - scaled.width()) // 2
+        y = (self.height() - scaled.height()) // 2
+        fade_in = min(1.0, self.state_timer / 42)
+        pulse = 0.018 * math.sin(self.tick * 0.07)
+        painter.save()
+        painter.setOpacity((0.38 + pulse) * fade_in)
+        painter.drawPixmap(x, y, scaled)
+        painter.restore()
+
+    def oriented_pose(self, name: str) -> QPixmap:
+        pose = self.poses[name]
+        if self.direction == -1:
+            return pose.transformed(QTransform().scale(-1, 1), Qt.TransformationMode.SmoothTransformation)
+        return pose
+
+    def pose_for_state(self) -> tuple[str, bool]:
+        if self.state == "cow_in":
+            return "walk", True
+        if self.state in {"point", "confirm", "transform"}:
+            return "point", False
+        if self.state == "eat":
+            return "graze", False
+        if self.state == "cow_out":
+            return "run", True
+        return "walk", False
+
+    def cow_rect(self, name: str, moving: bool) -> QRectF:
+        pose = self.oriented_pose(name)
+        bounce = abs(math.sin(self.tick * 0.24)) * 9 if moving else math.sin(self.tick * 0.08) * 2
+        return QRectF(
+            self.cow_x - pose.width() / 2,
+            self.ground_y - pose.height() - bounce,
+            pose.width(),
+            pose.height(),
         )
 
-    for nx in (-16, 16):
-        pygame.draw.circle(surface, (60, 60, 70), (muzzle_rect.centerx + nx, muzzle_rect.centery - 14), 4)
+    def draw_cow(self, painter: QPainter, name: str, moving: bool) -> QRectF:
+        pose = self.oriented_pose(name)
+        rect = self.cow_rect(name, moving)
+        shadow_width = pose.width() * 0.62
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(15, 25, 18, 70))
+        painter.drawEllipse(QRectF(self.cow_x - shadow_width / 2, self.ground_y - 12, shadow_width, 22))
+        painter.drawPixmap(rect.toRect(), pose)
+        return rect
 
+    def draw_grass(self, painter: QPainter, amount: float) -> None:
+        if self.target_pos is None:
+            return
+        amount = max(0.0, min(1.0, amount))
+        x = self.target_pos.x()
+        base_y = self.target_pos.y() + 36
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(25, 105, 55, int(210 * amount)))
+        painter.drawEllipse(QRectF(x - 65, base_y - 7, 130, 16))
+        for index in range(19):
+            offset = (index - 9) * 6
+            height = (25 + index % 5 * 8) * amount
+            sway = math.sin(self.tick * 0.12 + index) * 5
+            color = GREEN if index % 2 else DARK_GREEN
+            color.setAlpha(int(255 * amount))
+            painter.setPen(QPen(color, 4))
+            painter.drawLine(QPointF(x + offset, base_y), QPointF(x + offset + sway, base_y - height))
 
-def run() -> None:
-    pygame.init()
-    pygame.display.set_caption("Niu Lai - Desktop Cleaner")
+    def cow_bubble_rect(self, width: int, height: int) -> QRectF:
+        pose_name, moving = self.pose_for_state()
+        cow = self.cow_rect(pose_name, moving)
+        x = cow.center().x() - width / 2
+        y = cow.top() - height - 14
+        x = max(18.0, min(self.width() - width - 18.0, x))
+        if y < 18:
+            if cow.center().x() < self.width() / 2:
+                x = min(self.width() - width - 18.0, cow.right() + 18.0)
+            else:
+                x = max(18.0, cow.left() - width - 18.0)
+            y = max(18.0, min(self.height() - height - 18.0, cow.top() + 25.0))
+        return QRectF(x, y, width, height)
 
-    info = pygame.display.Info()
-    width, height = info.current_w, info.current_h
+    def bubble_rect_for_state(self) -> QRectF | None:
+        if self.state == "point":
+            return self.cow_bubble_rect(370, 94)
+        if self.state == "confirm":
+            return self.cow_bubble_rect(min(510, self.width() - 36), 226)
+        if self.state in {"transform", "eat", "pause", "farewell", "cow_out"}:
+            return self.cow_bubble_rect(370, 94)
+        return None
 
-    target_dir = get_target_dir()
-    desktop_img = capture_desktop_image(width, height)
+    def draw_bubble_background(self, painter: QPainter, bubble: QRectF) -> None:
+        pose_name, moving = self.pose_for_state()
+        cow = self.cow_rect(pose_name, moving)
+        body = bubble.adjusted(0, 0, 0, -16)
+        tail_x = max(body.left() + 28, min(body.right() - 28, cow.center().x()))
 
-    screen = pygame.display.set_mode((width, height), pygame.NOFRAME)
+        shadow = QPainterPath()
+        shadow.addRoundedRect(body.translated(7, 8), 22, 22)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 183, 38, 205))
+        painter.drawPath(shadow)
 
-    try:
-        hwnd = pygame.display.get_wm_info().get("window")
-        if hwnd:
-            force_foreground(hwnd)
-    except Exception as exc:
-        log_error(exc)
+        path = QPainterPath()
+        path.addRoundedRect(body, 22, 22)
+        tail = QPainterPath()
+        tail.moveTo(tail_x - 14, body.bottom() - 1)
+        tail.lineTo(tail_x, bubble.bottom())
+        tail.lineTo(tail_x + 14, body.bottom() - 1)
+        tail.closeSubpath()
+        path.addPath(tail)
+        painter.setBrush(QColor(255, 250, 220, 250))
+        painter.setPen(QPen(QColor(78, 49, 33), 4))
+        painter.drawPath(path)
 
-    clock = pygame.time.Clock()
-    background = image_to_surface(desktop_img)
+        # Little hand-drawn emphasis marks make the bubble read like a comic.
+        painter.setPen(QPen(QColor(240, 87, 67), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(QPointF(body.left() + 24, body.top() - 7), QPointF(body.left() + 11, body.top() - 20))
+        painter.drawLine(QPointF(body.left() + 48, body.top() - 10), QPointF(body.left() + 43, body.top() - 27))
+        painter.setPen(QPen(QColor(43, 160, 89), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(QPointF(body.right() - 22, body.top() - 6), QPointF(body.right() - 7, body.top() - 18))
 
-    ground_y = height - GROUND_MARGIN
-    stop_x = width // 2
-    cow_x = -320.0
-    tick = 0
+    def draw_cow_bubble(self, painter: QPainter, text: str, subtext: str = "") -> None:
+        bubble = self.bubble_rect_for_state()
+        if bubble is None:
+            return
+        self.draw_bubble_background(painter, bubble)
+        body = bubble.adjusted(14, 8, -14, -24)
+        painter.setPen(QColor(76, 48, 33))
+        painter.setFont(self.font(21, True))
+        painter.drawText(body.adjusted(0, 0, 0, -22 if subtext else 0), Qt.AlignmentFlag.AlignCenter, text)
+        if subtext:
+            painter.setPen(DARK_GREEN)
+            painter.setFont(self.font(13))
+            painter.drawText(body.adjusted(0, 39, 0, 0), Qt.AlignmentFlag.AlignCenter, subtext)
 
-    state = "walk_in"
-    queue: list[Path] = []
-    total_to_eat = 0
-    eaten_count = 0
-    bite_interval = MIN_BITE_FRAMES
-    bite_timer = 0
-    pause_timer = 0
+    def update_interaction_mask(self) -> None:
+        if self.state == "aim" or self.target_pos is None:
+            self.clearMask()
+            return
 
-    font = None
-    for name in ("microsoftyahei", "simhei", "arial"):
-        try:
-            font = pygame.font.SysFont(name, 40)
-            if font is not None:
-                break
-        except Exception:
-            continue
-    if font is None:
-        font = pygame.font.Font(None, 40)
+        pose_name, moving = self.pose_for_state()
+        cow = self.cow_rect(pose_name, moving).adjusted(-28, -28, 28, 28).toAlignedRect()
+        region = QRegion(cow)
+        if self.state in {"cow_in", "point", "confirm", "transform", "eat", "pause"}:
+            target = QRect(
+                int(self.target_pos.x() - 115),
+                int(self.target_pos.y() - 115),
+                230,
+                230,
+            )
+            region |= QRegion(target)
+        bubble = self.bubble_rect_for_state()
+        if bubble is not None:
+            region |= QRegion(bubble.adjusted(-30, -30, 30, 18).toAlignedRect())
+        self.setMask(region)
 
-    running = True
-    while running:
-        clock.tick(FPS)
-        tick += 1
+    def draw_confirmation(self, painter: QPainter) -> None:
+        bubble = self.bubble_rect_for_state()
+        if bubble is None:
+            return
+        self.draw_bubble_background(painter, bubble)
+        body = bubble.adjusted(0, 0, 0, -16)
+        painter.setPen(QColor(76, 48, 33))
+        painter.setFont(self.font(22, True))
+        painter.drawText(body.adjusted(18, 10, -18, -146), Qt.AlignmentFlag.AlignCenter, "妈！真吃这个？")
+        painter.setPen(DARK_GREEN)
+        painter.setFont(self.font(14))
+        filename = self.target_file.name
+        if len(filename) > 28:
+            filename = filename[:25] + "…"
+        painter.drawText(body.adjusted(22, 61, -22, -103), Qt.AlignmentFlag.AlignCenter, f"「{filename}」")
+        painter.setPen(QColor(92, 104, 104))
+        painter.setFont(self.font(12))
+        painter.drawText(body.adjusted(18, 103, -18, -61), Qt.AlignmentFlag.AlignCenter, "我一口下去，它就进废纸篓")
 
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                running = False
+        button_y = int(body.bottom() - 54)
+        button_width = int((body.width() - 54) / 2)
+        self.yes_rect = QRect(int(body.left() + 18), button_y, button_width, 42)
+        self.no_rect = QRect(int(body.left() + 36 + button_width), button_y, button_width, 42)
+        self.draw_button(painter, self.yes_rect, "喂！别客气", QColor(240, 87, 67))
+        self.draw_button(painter, self.no_rect, "等等，瞄歪了", QColor(43, 160, 137))
 
-        mouth_open = False
+    def draw_button(self, painter: QPainter, rect: QRect, text: str, color: QColor) -> None:
+        painter.setPen(QPen(QColor(76, 48, 33), 3))
+        painter.setBrush(color)
+        painter.drawRoundedRect(QRectF(rect), 23, 23)
+        painter.setPen(WHITE)
+        painter.setFont(self.font(14, True))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
-        if state == "walk_in":
-            cow_x += COW_SPEED
-            if cow_x >= stop_x:
-                cow_x = stop_x
-                queue = list_target_files(target_dir)
-                total_to_eat = len(queue)
-                if queue:
-                    bite_interval = max(
-                        MIN_BITE_FRAMES,
-                        min(MAX_BITE_FRAMES, EAT_PHASE_TARGET_FRAMES // max(1, len(queue))),
-                    )
-                    state = "eat"
-                else:
-                    state = "walk_out"
+    def draw_dust_cloud(self, painter: QPainter) -> None:
+        pose = self.oriented_pose("run")
+        behind = self.cow_x - self.direction * (pose.width() * 0.48)
+        painter.setPen(QPen(QColor(78, 49, 33, 90), 2))
+        for index, radius in enumerate((18, 13, 9, 6)):
+            drift = index * 24 * self.direction
+            bob = math.sin(self.tick * 0.3 + index) * 5
+            center = QPointF(behind - drift, self.ground_y - 12 - bob)
+            painter.setBrush(QColor(255, 241, 194, 205 - index * 30))
+            painter.drawEllipse(center, radius, radius * 0.72)
 
-        elif state == "eat":
-            bite_timer += 1
-            phase = bite_timer % bite_interval
-            mouth_open = phase < max(1, bite_interval // 2)
-            if phase == 0 and queue:
-                item = queue.pop(0)
-                if eat_one(item):
-                    eaten_count += 1
-            if not queue and phase == 0:
-                state = "pause"
-                pause_timer = 0
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
-        elif state == "pause":
-            pause_timer += 1
-            mouth_open = False
-            if pause_timer >= WALK_OUT_PAUSE_FRAMES:
-                state = "walk_out"
+        if self.state == "aim":
+            # Only aiming briefly owns the full screen. Every later phase is a
+            # small shaped overlay around the cow, target and speech bubble.
+            painter.fillRect(self.rect(), QColor(1, 16, 16, 38))
+            self.draw_aim_background(painter)
+            self.draw_pill(painter, "瞄准那份“不想要了”的文件", self.target_file.name)
+            self.draw_crosshair(painter, QPointF(self.mapFromGlobal(QCursor.pos())))
+            return
 
-        elif state == "walk_out":
-            cow_x += COW_SPEED
-            if cow_x > width + 400:
-                running = False
+        if self.target_pos is None:
+            return
 
-        if background is not None:
-            screen.blit(background, (0, 0))
-        else:
-            screen.fill((25, 20, 35))
-
-        draw_cow(screen, int(cow_x), ground_y, mouth_open, tick)
-
-        if state in ("eat", "pause", "walk_out") and total_to_eat > 0:
-            label = f"哞~ 吃掉了 {eaten_count} / {total_to_eat} 个文件!"
-            text = font.render(label, True, (255, 255, 255))
-            shadow = font.render(label, True, (0, 0, 0))
-            tx = width // 2 - text.get_width() // 2
-            screen.blit(shadow, (tx + 2, 42))
-            screen.blit(text, (tx, 40))
-
-        pygame.display.flip()
-
-    pygame.quit()
+        if self.state == "cow_in":
+            self.draw_cow(painter, "walk", moving=True)
+        elif self.state in {"point", "confirm", "transform"}:
+            if self.state == "transform":
+                progress = min(1.0, self.state_timer / TRANSFORM_FRAMES)
+                glow = QColor(75, 230, 103, int(120 * (1 - progress * 0.4)))
+                painter.setPen(QPen(glow, 5))
+                painter.setBrush(QColor(85, 240, 115, int(45 * progress)))
+                painter.drawEllipse(self.target_pos, 28 + progress * 45, 28 + progress * 45)
+                self.draw_grass(painter, progress)
+            self.draw_cow(painter, "point", moving=False)
+            if self.state == "point":
+                self.draw_cow_bubble(painter, "妈！这玩意儿能吃吗？")
+            elif self.state == "confirm":
+                self.draw_confirmation(painter)
+            else:
+                self.draw_cow_bubble(painter, "收到！先变成草～")
+        elif self.state == "eat":
+            grass_amount = max(0.0, 1.0 - self.state_timer / (EAT_FRAMES * 0.72))
+            self.draw_grass(painter, grass_amount)
+            self.draw_cow(painter, "graze", moving=False)
+            self.draw_cow_bubble(painter, "嚼嚼嚼嚼……")
+        elif self.state == "pause":
+            self.draw_cow(painter, "walk", moving=False)
+            self.draw_cow_bubble(painter, "嗝——删得真香！" if self.deleted else "这草硌牙，没删动…")
+        elif self.state == "farewell":
+            self.draw_cow(painter, "walk", moving=False)
+            self.draw_cow_bubble(painter, "任务完成，牛走！")
+        elif self.state == "cow_out":
+            self.draw_dust_cloud(painter)
+            self.draw_cow(painter, "run", moving=True)
+            self.draw_cow_bubble(painter, "哒哒哒，溜了～")
 
 
 def main() -> int:
+    register_windows_context_menu()
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(True)
+    target = requested_file()
+    if target is None:
+        filename, _ = QFileDialog.getOpenFileName(None, "选择要让牛清理的文件", str(Path.home() / "Desktop"))
+        if not filename:
+            return 0
+        target = Path(filename)
+
+    hidden_application_pids: list[int] = []
     try:
-        run()
-        return 0
+        overlay = CowOverlay(target)
+        overlay.show()
+        configure_macos_overlay(overlay)
+        hidden_application_pids = reveal_macos_desktop()
+        overlay.hidden_application_pids = hidden_application_pids
+        overlay.raise_()
+        return app.exec()
     except Exception as exc:
         log_error(exc)
-        try:
-            pygame.quit()
-        except Exception:
-            pass
         return 1
+    finally:
+        restore_macos_applications(hidden_application_pids)
 
 
 if __name__ == "__main__":

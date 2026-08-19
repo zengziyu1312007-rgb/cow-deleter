@@ -1,6 +1,4 @@
 # -*- mode: python ; coding: utf-8 -*-
-# Windows build configuration. Run this spec on Windows.
-
 
 a = Analysis(
     ['main.py'],
@@ -29,20 +27,44 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='NiuLaiCleaner',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
+    argv_emulation=True,
+    target_arch='arm64',
     codesign_identity=None,
     entitlements_file=None,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='NiuLaiCleaner',
+)
+app = BUNDLE(
+    coll,
+    name='NiuLaiCleaner.app',
+    icon=None,
+    bundle_identifier='com.ai-training-camp.niulai-cleaner',
+    info_plist={
+        'CFBundleDisplayName': '牛来清理桌面',
+        'NSHighResolutionCapable': True,
+        'LSMinimumSystemVersion': '11.0',
+        'CFBundleDocumentTypes': [
+            {
+                'CFBundleTypeName': 'File to feed the cow',
+                'CFBundleTypeRole': 'Viewer',
+                'LSItemContentTypes': ['public.data', 'public.folder'],
+            },
+        ],
+    },
 )

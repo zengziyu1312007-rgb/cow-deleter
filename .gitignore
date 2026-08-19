@@ -1,6 +1,11 @@
 __pycache__/
+.DS_Store
 *.pyc
 venv/
+.venv/
+.build-venv-macos/
+.build-venv-windows/
+demo-test-files/
 build/
 dist/
 *.error.log
